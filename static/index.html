@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Suppression & TAL Toolkit</title>
+<style>
+  :root {
+    --bg: #0f1420; --panel: #161d2e; --border: #2a3350; --text: #e6e9f0;
+    --muted: #8b93ab; --accent: #4f7cff; --accent2: #22c55e; --danger: #ef4444;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 24px 32px 8px; }
+  header h1 { margin: 0 0 4px; font-size: 22px; }
+  header p { margin: 0; color: var(--muted); font-size: 14px; }
+  nav.tabs { display: flex; gap: 4px; padding: 16px 32px 0; flex-wrap: wrap; border-bottom: 1px solid var(--border); }
+  nav.tabs button {
+    background: transparent; border: none; color: var(--muted); padding: 10px 16px;
+    font-size: 14px; cursor: pointer; border-bottom: 2px solid transparent;
+  }
+  nav.tabs button.active { color: var(--text); border-bottom-color: var(--accent); }
+  main { padding: 24px 32px 64px; max-width: 900px; }
+  .tool { display: none; }
+  .tool.active { display: block; }
+  .step { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 18px 20px; margin-bottom: 14px; }
+  .step h3 { margin: 0 0 6px; font-size: 15px; }
+  .step p.hint { margin: 0 0 10px; color: var(--muted); font-size: 13px; }
+  input[type=file], select, input[type=text] {
+    width: 100%; padding: 9px 10px; background: #0d1220; border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 13px;
+  }
+  label.checkbox { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--muted); margin-top: 8px; }
+  button.primary {
+    background: var(--accent); color: white; border: none; padding: 11px 22px; border-radius: 7px;
+    font-size: 14px; cursor: pointer; margin-top: 6px;
+  }
+  button.primary:hover { filter: brightness(1.1); }
+  button.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+  .stats { display: flex; gap: 12px; margin: 16px 0; flex-wrap: wrap; }
+  .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 14px 20px; min-width: 120px; }
+  .stat .num { font-size: 26px; font-weight: 600; }
+  .stat .lbl { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .downloads { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 10px; }
+  .downloads a {
+    background: var(--accent2); color: #06210f; padding: 9px 16px; border-radius: 7px;
+    text-decoration: none; font-size: 13px; font-weight: 600;
+  }
+  .error { background: rgba(239,68,68,0.12); border: 1px solid var(--danger); color: #fca5a5;
+    padding: 10px 14px; border-radius: 8px; font-size: 13px; margin-top: 10px; }
+  .input-toggle { display: flex; gap: 6px; margin-bottom: 8px; }
+  .input-toggle .toggle-btn {
+    background: #0d1220; border: 1px solid var(--border); color: var(--muted);
+    padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer;
+  }
+  .input-toggle .toggle-btn.active { background: var(--accent); color: white; border-color: var(--accent); }
+  textarea.paste-area {
+    width: 100%; min-height: 100px; padding: 9px 10px; background: #0d1220; border: 1px solid var(--border);
+    border-radius: 6px; color: var(--text); font-size: 13px; font-family: monospace; resize: vertical;
+  }
+  table.groups { width: 100%; border-collapse: collapse; margin-top: 10px; font-size: 13px; }
+  table.groups th, table.groups td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--border); }
+  .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid rgba(255,255,255,0.3);
+    border-top-color: white; border-radius: 50%; animation: spin 0.7s linear infinite; margin-right: 8px; vertical-align: middle; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Suppression &amp; TAL Toolkit</h1>
+  <p>Local FastAPI-powered suppression &amp; account matching tools.</p>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button data-tool="email-scrubber" class="active">✉️ Email Scrubber</button>
+  <button data-tool="tal-scrubber">🛡️ TAL : SUPP Scrubber</button>
+  <button data-tool="tal-overlap">🎯 TAL : SUPP Overlap Analysis</button>
+  <button data-tool="combine-split">🧰 List Combine &amp; Split</button>
+  <button data-tool="list-compare">📋 List Comparison</button>
+</nav>
+
+<main>
+
+  <!-- TOOL 1: Email Scrubber -->
+  <section class="tool active" id="email-scrubber">
+    <div class="step">
+      <h3>Step 1 — Suppression file</h3>
+      <p class="hint">MD5-hashed or plain emails. Mixed formats are auto-detected.</p>
+      <div class="input-toggle" data-target="es-supp">
+        <button type="button" class="toggle-btn active" data-mode="file">📁 Upload file</button>
+        <button type="button" class="toggle-btn" data-mode="paste">📋 Paste list</button>
+      </div>
+      <input type="file" id="es-supp-file" accept=".csv,.txt,.xlsx,.xls">
+      <textarea id="es-supp-paste" class="paste-area" style="display:none" placeholder="Paste one email or MD5 hash per line…"></textarea>
+    </div>
+    <div class="step">
+      <h3>Step 2 — Lead list</h3>
+      <p class="hint">Got a short list (say, 20 leads)? Just paste them below — one email per line. No need to build a spreadsheet for it. Uploading a file works too.</p>
+      <div class="input-toggle" data-target="es-lead">
+        <button type="button" class="toggle-btn" data-mode="file">📁 Upload file</button>
+        <button type="button" class="toggle-btn active" data-mode="paste">📋 Paste list</button>
+      </div>
+      <input type="file" id="es-lead-file" accept=".csv,.txt,.xlsx,.xls" style="display:none">
+      <textarea id="es-lead-paste" class="paste-area" placeholder="Paste one email per line, e.g.&#10;john@example.com&#10;jane@example.com&#10;..."></textarea>
+    </div>
+    <div class="step">
+      <h3>Step 3 — Select email column</h3>
+      <p class="hint">Which column contains email addresses? Auto-detected once you provide the lead list; change it if it picked the wrong one.</p>
+      <select id="es-email-column"><option value="">Upload or paste a lead list first…</option></select>
+    </div>
+    <div class="step">
+      <h3>Step 4 — Output filename (optional)</h3>
+      <input type="text" id="es-out-name" placeholder="scrubbed_leads">
+    </div>
+    <button class="primary" onclick="runEmailScrubber()">Scrub list</button>
+    <div id="es-error"></div>
+    <div class="stats" id="es-stats"></div>
+    <div class="downloads" id="es-downloads"></div>
+    <div id="es-duplicates-table"></div>
+    <div id="es-all-leads-table"></div>
+  </section>
+
+  <!-- TOOL 2: TAL : SUPP Scrubber -->
+  <section class="tool" id="tal-scrubber">
+    <div class="step">
+      <h3>Step 1 — Suppression file</h3>
+      <p class="hint">Account/domain suppression file (.xlsx or .csv). Domain/website/company column auto-detected.</p>
+      <input type="file" id="ts-supp-file" accept=".csv,.txt,.xlsx,.xls">
+    </div>
+    <div class="step">
+      <h3>Step 2 — TAL</h3>
+      <p class="hint">Your Target Account List (.csv or .xlsx).</p>
+      <input type="file" id="ts-tal-file" accept=".csv,.txt,.xlsx,.xls">
+    </div>
+    <div class="step">
+      <h3>Step 3 — Output filename (optional)</h3>
+      <input type="text" id="ts-out-name" placeholder="scrubbed_tal">
+    </div>
+    <button class="primary" onclick="runTalScrubber()">Compare TAL vs Suppression</button>
+    <div id="ts-error"></div>
+    <div class="stats" id="ts-stats"></div>
+    <div class="downloads" id="ts-downloads"></div>
+  </section>
+
+  <!-- TOOL 3: TAL : SUPP Overlap Analysis -->
+  <section class="tool" id="tal-overlap">
+    <div class="step">
+      <h3>Step 1 — TAL</h3>
+      <p class="hint">Target Account List. Results are appended as two new columns.</p>
+      <input type="file" id="to-tal-file" accept=".csv,.txt,.xlsx,.xls">
+    </div>
+    <div class="step">
+      <h3>Step 2 — Account suppression file</h3>
+      <input type="file" id="to-acct-file" accept=".csv,.txt,.xlsx,.xls">
+    </div>
+    <div class="step">
+      <h3>Step 3 — Email suppression file</h3>
+      <p class="hint">Domains are extracted from email addresses automatically.</p>
+      <input type="file" id="to-email-file" accept=".csv,.txt,.xlsx,.xls">
+    </div>
+    <div class="step">
+      <h3>Output filename (optional)</h3>
+      <input type="text" id="to-out-name" placeholder="enriched_tal">
+    </div>
+    <button class="primary" onclick="runTalOverlap()">Run Overlap Analysis</button>
+    <div id="to-error"></div>
+    <div class="stats" id="to-stats"></div>
+    <div class="downloads" id="to-downloads"></div>
+  </section>
+
+  <!-- TOOL 4: Combine & Split -->
+  <section class="tool" id="combine-split">
+    <div class="step">
+      <h3>📥 Combine</h3>
+      <p class="hint">Upload any combination of TAL, suppression, or email files (.csv, .xlsx multi-tab, .txt). Emails and account rows are separated and deduped automatically.</p>
+      <input type="file" id="cb-files" multiple accept=".csv,.txt,.xlsx,.xls">
+      <input type="text" id="cb-out-name" placeholder="combined" style="margin-top:8px;">
+      <div><button class="primary" onclick="runCombine()">Normalize &amp; Combine</button></div>
+      <div id="cb-error"></div>
+      <div class="stats" id="cb-stats"></div>
+      <div class="downloads" id="cb-downloads"></div>
+    </div>
+
+    <div class="step">
+      <h3>📤 Split</h3>
+      <p class="hint">Upload a single file. Each unique value in the chosen column becomes a separate CSV, downloaded as a ZIP.</p>
+      <input type="file" id="sp-file" accept=".csv,.xlsx,.xls" onchange="loadSplitColumns()">
+      <select id="sp-column" style="margin-top:8px;"><option value="">Upload a file first…</option></select>
+      <input type="text" id="sp-out-name" placeholder="split_output" style="margin-top:8px;">
+      <div><button class="primary" onclick="runSplit()">Generate ZIP</button></div>
+      <div id="sp-error"></div>
+      <div id="sp-groups"></div>
+      <div class="downloads" id="sp-downloads"></div>
+    </div>
+  </section>
+
+  <!-- TOOL 5: List Comparison -->
+  <section class="tool" id="list-compare">
+    <div class="step">
+      <h3>List 1</h3>
+      <div class="input-toggle" data-target="lc-l1">
+        <button type="button" class="toggle-btn active" data-mode="file">📁 Upload file</button>
+        <button type="button" class="toggle-btn" data-mode="paste">📋 Paste list</button>
+      </div>
+      <input type="file" id="lc-l1-file" accept=".csv,.txt,.xlsx,.xls">
+      <textarea id="lc-l1-paste" class="paste-area" style="display:none" placeholder="Paste one value per line…"></textarea>
+    </div>
+    <div class="step">
+      <h3>List 2</h3>
+      <div class="input-toggle" data-target="lc-l2">
+        <button type="button" class="toggle-btn active" data-mode="file">📁 Upload file</button>
+        <button type="button" class="toggle-btn" data-mode="paste">📋 Paste list</button>
+      </div>
+      <input type="file" id="lc-l2-file" accept=".csv,.txt,.xlsx,.xls">
+      <textarea id="lc-l2-paste" class="paste-area" style="display:none" placeholder="Paste one value per line…"></textarea>
+    </div>
+    <div class="step">
+      <h3>List 3 (optional)</h3>
+      <div class="input-toggle" data-target="lc-l3">
+        <button type="button" class="toggle-btn active" data-mode="file">📁 Upload file</button>
+        <button type="button" class="toggle-btn" data-mode="paste">📋 Paste list</button>
+      </div>
+      <input type="file" id="lc-l3-file" accept=".csv,.txt,.xlsx,.xls">
+      <textarea id="lc-l3-paste" class="paste-area" style="display:none" placeholder="Paste one value per line…"></textarea>
+    </div>
+    <label class="checkbox"><input type="checkbox" id="lc-dedupe" checked> Deduplicate rows within each list before comparing</label>
+    <div class="step" style="margin-top:14px;">
+      <input type="text" id="lc-out-name" placeholder="list_comparison">
+    </div>
+    <button class="primary" onclick="runListCompare()">Compare Lists</button>
+    <div id="lc-error"></div>
+    <div class="stats" id="lc-stats"></div>
+    <div class="downloads" id="lc-downloads"></div>
+  </section>
+
+</main>
+
+<script>
+document.querySelectorAll('nav.tabs button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('nav.tabs button').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tool').forEach(t => t.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById(btn.dataset.tool).classList.add('active');
+  });
+});
+
+function showError(elId, msg) {
+  document.getElementById(elId).innerHTML = msg ? `<div class="error">${msg}</div>` : '';
+}
+function statHtml(num, label) {
+  return `<div class="stat"><div class="num">${num}</div><div class="lbl">${label}</div></div>`;
+}
+function btnLoading(btn, loading, originalText) {
+  btn.disabled = loading;
+  btn.innerHTML = loading ? `<span class="spinner"></span>Working…` : originalText;
+}
+
+async function postForm(url, formData) {
+  const res = await fetch(url, { method: 'POST', body: formData });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || `Request failed (${res.status})`);
+  return data;
+}
+
+// Wire up every upload/paste toggle on the page.
+document.querySelectorAll('.input-toggle').forEach(toggle => {
+  const target = toggle.dataset.target;
+  const fileInput = document.getElementById(`${target}-file`);
+  const pasteArea = document.getElementById(`${target}-paste`);
+  toggle.querySelectorAll('.toggle-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      toggle.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      if (btn.dataset.mode === 'file') {
+        fileInput.style.display = '';
+        pasteArea.style.display = 'none';
+      } else {
+        fileInput.style.display = 'none';
+        pasteArea.style.display = '';
+      }
+      if (target === 'es-lead') loadEmailColumns();
+    });
+  });
+});
+
+// --- Step 3: auto-detect / manually override which column holds the email ---
+async function loadEmailColumns() {
+  const sel = document.getElementById('es-email-column');
+  const fd = new FormData();
+  const provided = appendFileOrText(fd, 'es-lead', 'file', 'text');
+  if (!provided) {
+    sel.innerHTML = '<option value="">Upload or paste a lead list first…</option>';
+    return;
+  }
+  sel.innerHTML = '<option>Detecting columns…</option>';
+  try {
+    const d = await postForm('/api/lead-columns', fd);
+    sel.innerHTML = d.columns.map(c =>
+      `<option value="${c}" ${c === d.detected ? 'selected' : ''}>${c}${c === d.detected ? ' (auto-detected)' : ''}</option>`
+    ).join('');
+  } catch (e) {
+    sel.innerHTML = '<option value="">Could not read columns — will auto-detect on scrub</option>';
+  }
+}
+document.getElementById('es-lead-file').addEventListener('change', loadEmailColumns);
+document.getElementById('es-lead-paste').addEventListener('input', () => {
+  clearTimeout(window.__esLeadPasteTimer);
+  window.__esLeadPasteTimer = setTimeout(loadEmailColumns, 500);
+});
+
+// Append either the uploaded file or the pasted text under the given field names.
+// Returns true if something was provided, false if both are empty.
+function appendFileOrText(fd, target, fileField, textField) {
+  const fileInput = document.getElementById(`${target}-file`);
+  const pasteArea = document.getElementById(`${target}-paste`);
+  const usingPaste = pasteArea.style.display !== 'none';
+  if (usingPaste) {
+    if (!pasteArea.value.trim()) return false;
+    fd.append(textField, pasteArea.value);
+    return true;
+  }
+  const file = fileInput.files[0];
+  if (!file) return false;
+  fd.append(fileField, file);
+  return true;
+}
+
+// --- Tool 1: Email Scrubber ---
+async function runEmailScrubber() {
+  const btn = event.target;
+  showError('es-error', ''); document.getElementById('es-stats').innerHTML = ''; document.getElementById('es-downloads').innerHTML = '';
+  const fd = new FormData();
+  const hasSupp = appendFileOrText(fd, 'es-supp', 'suppression_file', 'suppression_text');
+  const hasLead = appendFileOrText(fd, 'es-lead', 'leads_file', 'leads_text');
+  if (!hasSupp || !hasLead) return showError('es-error', 'Please provide both the suppression file/list and the lead file/list.');
+  const chosenColumn = document.getElementById('es-email-column').value;
+  if (chosenColumn) fd.append('email_column', chosenColumn);
+  fd.append('out_filename', document.getElementById('es-out-name').value || 'scrubbed_leads');
+  btnLoading(btn, true);
+  try {
+    const d = await postForm('/api/email-scrubber', fd);
+    document.getElementById('es-stats').innerHTML =
+      statHtml(d.total_leads, 'Total leads') + statHtml(d.suppressed, 'Found in suppression') +
+      statHtml(d.duplicates, 'Duplicates in list') + statHtml(d.clean, 'Clean leads');
+    // Reflect the column actually used back into Step 3, in case it was auto-detected.
+    const sel = document.getElementById('es-email-column');
+    if (sel.value !== d.email_column_used && [...sel.options].some(o => o.value === d.email_column_used)) {
+      sel.value = d.email_column_used;
+    }
+    document.getElementById('es-downloads').innerHTML =
+      `<a href="${d.clean_download}">⬇ Download clean list</a><a href="${d.suppressed_download}">⬇ Download suppressed</a>` +
+      (d.duplicates > 0 ? `<a href="${d.duplicates_download}">⬇ Download duplicates</a>` : '') +
+      `<a href="${d.all_leads_download}">⬇ Download all leads (annotated)</a>`;
+
+    const dupTableEl = document.getElementById('es-duplicates-table');
+    if (d.duplicates_preview && d.duplicates_preview.length) {
+      const cols = Object.keys(d.duplicates_preview[0]);
+      const shownCount = d.duplicates_preview.length;
+      const note = d.duplicates > shownCount ? `<p class="hint">Showing first ${shownCount} of ${d.duplicates} duplicates — download the full list above.</p>` : '';
+      dupTableEl.innerHTML =
+        `<h3 style="margin-top:18px;">Duplicate entries found</h3>${note}` +
+        '<table class="groups"><tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr>' +
+        d.duplicates_preview.map(row => '<tr>' + cols.map(c => `<td>${row[c] ?? ''}</td>`).join('') + '</tr>').join('') +
+        '</table>';
+    } else {
+      dupTableEl.innerHTML = '';
+    }
+
+    const allTableEl = document.getElementById('es-all-leads-table');
+    if (d.suppressed_preview && d.suppressed_preview.length) {
+      const cols = Object.keys(d.suppressed_preview[0]);
+      const shownCount = d.suppressed_preview.length;
+      const note = d.suppressed_preview_truncated ? `<p class="hint">Showing first ${shownCount} of ${d.suppressed} leads found in suppression — download suppressed above for the full list.</p>` : '';
+      allTableEl.innerHTML =
+        `<h3 style="margin-top:18px;">Leads found in suppression</h3>${note}` +
+        '<table class="groups"><tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr>' +
+        d.suppressed_preview.map(row => '<tr>' + cols.map(c => `<td>${row[c] ?? ''}</td>`).join('') + '</tr>').join('') +
+        '</table>';
+    } else {
+      allTableEl.innerHTML = '<p class="hint" style="margin-top:18px;">No leads were found in the suppression list.</p>';
+    }
+  } catch (e) { showError('es-error', e.message); }
+  btnLoading(btn, false, 'Scrub list');
+}
+
+// --- Tool 2: TAL : SUPP Scrubber ---
+async function runTalScrubber() {
+  const btn = event.target;
+  showError('ts-error', ''); document.getElementById('ts-stats').innerHTML = ''; document.getElementById('ts-downloads').innerHTML = '';
+  const supp = document.getElementById('ts-supp-file').files[0];
+  const tal = document.getElementById('ts-tal-file').files[0];
+  if (!supp || !tal) return showError('ts-error', 'Please upload both files.');
+  const fd = new FormData();
+  fd.append('suppression_file', supp);
+  fd.append('tal_file', tal);
+  fd.append('out_filename', document.getElementById('ts-out-name').value || 'scrubbed_tal');
+  btnLoading(btn, true);
+  try {
+    const d = await postForm('/api/tal-scrubber', fd);
+    document.getElementById('ts-stats').innerHTML =
+      statHtml(d.total_tal, 'TAL accounts') + statHtml(d.suppressed, 'On suppression') + statHtml(d.clean, 'Clean accounts');
+    document.getElementById('ts-downloads').innerHTML =
+      `<a href="${d.clean_download}">⬇ Download clean TAL</a><a href="${d.suppressed_download}">⬇ Download suppressed</a>`;
+  } catch (e) { showError('ts-error', e.message); }
+  btnLoading(btn, false, 'Compare TAL vs Suppression');
+}
+
+// --- Tool 3: TAL : SUPP Overlap Analysis ---
+async function runTalOverlap() {
+  const btn = event.target;
+  showError('to-error', ''); document.getElementById('to-stats').innerHTML = ''; document.getElementById('to-downloads').innerHTML = '';
+  const tal = document.getElementById('to-tal-file').files[0];
+  const acct = document.getElementById('to-acct-file').files[0];
+  const email = document.getElementById('to-email-file').files[0];
+  if (!tal || !acct || !email) return showError('to-error', 'Please upload all three files.');
+  const fd = new FormData();
+  fd.append('tal_file', tal);
+  fd.append('account_suppression_file', acct);
+  fd.append('email_suppression_file', email);
+  fd.append('out_filename', document.getElementById('to-out-name').value || 'enriched_tal');
+  btnLoading(btn, true);
+  try {
+    const d = await postForm('/api/tal-overlap', fd);
+    document.getElementById('to-stats').innerHTML =
+      statHtml(d.total_tal, 'TAL accounts') + statHtml(d.on_account_supp, 'On account supp') + statHtml(d.on_email_supp, 'On email supp');
+    document.getElementById('to-downloads').innerHTML = `<a href="${d.download}">⬇ Download enriched TAL</a>`;
+  } catch (e) { showError('to-error', e.message); }
+  btnLoading(btn, false, 'Run Overlap Analysis');
+}
+
+// --- Tool 4a: Combine ---
+async function runCombine() {
+  const btn = event.target;
+  showError('cb-error', ''); document.getElementById('cb-stats').innerHTML = ''; document.getElementById('cb-downloads').innerHTML = '';
+  const files = document.getElementById('cb-files').files;
+  if (!files.length) return showError('cb-error', 'Please upload at least one file.');
+  const fd = new FormData();
+  for (const f of files) fd.append('files', f);
+  fd.append('out_filename', document.getElementById('cb-out-name').value || 'combined');
+  btnLoading(btn, true);
+  try {
+    const d = await postForm('/api/combine', fd);
+    document.getElementById('cb-stats').innerHTML =
+      statHtml(d.account_rows, 'Account rows') + statHtml(d.sources, 'Sources') + statHtml(d.email_rows, 'Email rows');
+    document.getElementById('cb-downloads').innerHTML =
+      `<a href="${d.accounts_download}">⬇ Download accounts</a><a href="${d.emails_download}">⬇ Download emails</a>`;
+  } catch (e) { showError('cb-error', e.message); }
+  btnLoading(btn, false, 'Normalize & Combine');
+}
+
+// --- Tool 4b: Split ---
+async function loadSplitColumns() {
+  const file = document.getElementById('sp-file').files[0];
+  const sel = document.getElementById('sp-column');
+  if (!file) return;
+  sel.innerHTML = '<option>Loading…</option>';
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const d = await postForm('/api/split/columns', fd);
+    sel.innerHTML = d.columns.map(c => `<option value="${c}">${c}</option>`).join('');
+  } catch (e) { showError('sp-error', e.message); }
+}
+async function runSplit() {
+  const btn = event.target;
+  showError('sp-error', ''); document.getElementById('sp-groups').innerHTML = ''; document.getElementById('sp-downloads').innerHTML = '';
+  const file = document.getElementById('sp-file').files[0];
+  const column = document.getElementById('sp-column').value;
+  if (!file || !column) return showError('sp-error', 'Upload a file and choose a column.');
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('column', column);
+  fd.append('out_filename', document.getElementById('sp-out-name').value || 'split_output');
+  btnLoading(btn, true);
+  try {
+    const d = await postForm('/api/split', fd);
+    document.getElementById('sp-groups').innerHTML =
+      '<table class="groups"><tr><th>Group</th><th>Rows</th></tr>' +
+      d.groups.map(g => `<tr><td>${g.group}</td><td>${g.rows}</td></tr>`).join('') + '</table>';
+    document.getElementById('sp-downloads').innerHTML = `<a href="${d.download}">⬇ Download ZIP</a>`;
+  } catch (e) { showError('sp-error', e.message); }
+  btnLoading(btn, false, 'Generate ZIP');
+}
+
+// --- Tool 5: List Comparison ---
+async function runListCompare() {
+  const btn = event.target;
+  showError('lc-error', ''); document.getElementById('lc-stats').innerHTML = ''; document.getElementById('lc-downloads').innerHTML = '';
+  const fd = new FormData();
+  const has1 = appendFileOrText(fd, 'lc-l1', 'list1', 'list1_text');
+  const has2 = appendFileOrText(fd, 'lc-l2', 'list2', 'list2_text');
+  appendFileOrText(fd, 'lc-l3', 'list3', 'list3_text');
+  if (!has1 || !has2) return showError('lc-error', 'Please provide at least List 1 and List 2 (file or pasted).');
+  fd.append('dedupe_within', document.getElementById('lc-dedupe').checked);
+  fd.append('out_filename', document.getElementById('lc-out-name').value || 'list_comparison');
+  btnLoading(btn, true);
+  try {
+    const d = await postForm('/api/list-compare', fd);
+    let html = statHtml(d.total_unique, 'Total unique') + statHtml(d.in_all, 'In all') +
+               statHtml(d.in_exactly_2, 'In exactly 2') + statHtml(d.in_exactly_1, 'In exactly 1');
+    d.per_list_counts.forEach((c, i) => { html += statHtml(c, `List ${i+1} count`); });
+    document.getElementById('lc-stats').innerHTML = html;
+    document.getElementById('lc-downloads').innerHTML = `<a href="${d.download}">⬇ Download comparison</a>`;
+  } catch (e) { showError('lc-error', e.message); }
+  btnLoading(btn, false, 'Compare Lists');
+}
+</script>
+
+</body>
+</html>
