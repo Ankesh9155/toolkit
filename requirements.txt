@@ -2,4 +2,5 @@ fastapi
 uvicorn[standard]
 pandas==2.2.3
 openpyxl
+xlsxwriter
 python-multipart

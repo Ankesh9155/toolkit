@@ -49,7 +49,8 @@ def read_tables(content: bytes, filename: str) -> dict:
     emails/hashes) which pandas would otherwise misread as a header."""
     name = filename.lower()
     if name.endswith((".xlsx", ".xlsm", ".xls")):
-        xls = pd.ExcelFile(io.BytesIO(content))
+        engine_kwargs = {"read_only": True} if name.endswith((".xlsx", ".xlsm")) else None
+        xls = pd.ExcelFile(io.BytesIO(content), engine_kwargs=engine_kwargs)
         tables = {sheet: xls.parse(sheet) for sheet in xls.sheet_names}
     elif name.endswith(".csv"):
         tables = {"Sheet1": pd.read_csv(io.BytesIO(content))}
@@ -248,10 +249,12 @@ def email_scrubber(supp_content, supp_name, lead_content, lead_name, email_colum
 
     # Full annotated view: every lead, with its suppression + duplicate status,
     # for displaying the whole list in the UI (not just the duplicates).
-    annotated_df = leads_df.copy()
-    annotated_df["Found in suppression"] = mask.map({True: "Yes", False: "No"})
-    annotated_df["Duplicate"] = annotated_df.index.map(lambda i: "Yes" if i in dup_reasons else "No")
-    annotated_df["Duplicate reason"] = annotated_df.index.map(lambda i: dup_reasons.get(i, ""))
+    # leads_df isn't needed unmodified after this point, so annotate it in
+    # place instead of holding a second full copy alongside it.
+    leads_df["Found in suppression"] = mask.map({True: "Yes", False: "No"})
+    leads_df["Duplicate"] = leads_df.index.map(lambda i: "Yes" if i in dup_reasons else "No")
+    leads_df["Duplicate reason"] = leads_df.index.map(lambda i: dup_reasons.get(i, ""))
+    annotated_df = leads_df
 
     return {
         "total_leads": len(leads_df),
@@ -505,7 +508,9 @@ def compare_lists(files, dedupe_within=True):
 
 def df_to_excel_bytes(sheets: dict) -> bytes:
     buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+    # constant_memory streams rows straight to disk instead of buffering the
+    # whole workbook as Python objects, which matters for large uploads.
+    with pd.ExcelWriter(buf, engine="xlsxwriter", engine_kwargs={"options": {"constant_memory": True}}) as writer:
         for sheet_name, df in sheets.items():
             safe_name = sheet_name[:31]
             (df if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=safe_name, index=False)
