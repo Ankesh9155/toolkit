@@ -20,6 +20,7 @@ result blobs kept in a process-local cache for download.
 """
 
 import io
+import time
 import uuid
 from typing import List, Optional
 
@@ -32,13 +33,23 @@ import logic
 app = FastAPI(title="Suppression & TAL Toolkit")
 
 # In-memory store for generated result files, keyed by a random token.
-# {token: {"filename": str, "bytes": bytes, "media_type": str}}
+# {token: {"filename": str, "bytes": bytes, "media_type": str, "created": float}}
+# Entries are purged after _RESULT_TTL_SECONDS to avoid unbounded memory growth.
 _RESULTS = {}
+_RESULT_TTL_SECONDS = 20 * 60
+
+
+def _purge_expired_results():
+    now = time.time()
+    expired = [t for t, item in _RESULTS.items() if now - item["created"] > _RESULT_TTL_SECONDS]
+    for t in expired:
+        del _RESULTS[t]
 
 
 def _store(filename: str, data: bytes, media_type: str) -> str:
+    _purge_expired_results()
     token = uuid.uuid4().hex
-    _RESULTS[token] = {"filename": filename, "bytes": data, "media_type": media_type}
+    _RESULTS[token] = {"filename": filename, "bytes": data, "media_type": media_type, "created": time.time()}
     return token
 
 
