@@ -51,3 +51,7 @@ Open **http://127.0.0.1:8000** in your browser.
   email/domain regex patterns.
 - Generated files are held in memory only for download and are cleared when
   the server restarts.
+- Uploads over 9MB (.xlsx/.xlsm/.csv) are parsed in row batches (20,000 rows
+  at a time) instead of being loaded whole, so peak memory during parsing
+  stays bounded on larger files. Output is identical either way — this only
+  changes how the file is read in, not what comes out.
