@@ -91,7 +91,10 @@ async def lead_columns_endpoint(
     text: Optional[str] = Form(None),
 ):
     content, name = await _resolve_input(file, text, "leads_file")
-    df = logic.read_single_table(content, name)
+    try:
+        df = logic.read_single_table(content, name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     detected = logic.detect_email_column(df)
     return JSONResponse({"columns": list(df.columns), "detected": detected})
 
@@ -225,7 +228,10 @@ async def combine_endpoint(
     for f in files:
         content, name = await _read(f)
         pairs.append((content, name))
-    result = logic.combine_lists(pairs)
+    try:
+        result = logic.combine_lists(pairs)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     acct_bytes = logic.df_to_excel_bytes({"Accounts": result["account_df"]})
     email_bytes = logic.df_to_excel_bytes({"Emails": result["email_df"]})
@@ -250,7 +256,10 @@ async def combine_endpoint(
 @app.post("/api/split/columns")
 async def split_columns_endpoint(file: UploadFile = File(...)):
     content, name = await _read(file)
-    df = logic.read_single_table(content, name)
+    try:
+        df = logic.read_single_table(content, name)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     return JSONResponse({"columns": list(df.columns)})
 
 
@@ -299,7 +308,10 @@ async def list_compare_endpoint(
         content, name = await _resolve_input(f, t, f"list{idx}")
         pairs.append((content, name))
 
-    result = logic.compare_lists(pairs, dedupe_within=dedupe_within)
+    try:
+        result = logic.compare_lists(pairs, dedupe_within=dedupe_within)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     bytes_out = logic.df_to_excel_bytes({"Comparison": result["result_df"]})
     token = _store(f"{out_filename}.xlsx", bytes_out,
                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")

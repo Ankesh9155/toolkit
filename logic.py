@@ -10,16 +10,65 @@ import re
 import zipfile
 from collections import defaultdict
 
+import openpyxl
 import pandas as pd
 
 MD5_RE = re.compile(r"^[a-fA-F0-9]{32}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DOMAIN_RE = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$", re.IGNORECASE)
 
+# Uploads larger than this are parsed in row batches instead of being handed
+# to pandas whole, so peak memory during parsing stays bounded regardless of
+# how big the source file is (matters on Render's 512MB instance).
+CHUNK_SIZE_BYTES = 9 * 1024 * 1024  # 9 MB
+CHUNK_ROWS = 20_000
+
 
 # ---------------------------------------------------------------------------
 # File reading helpers
 # ---------------------------------------------------------------------------
+
+def _read_xlsx_chunked(content: bytes) -> dict:
+    """Stream an .xlsx/.xlsm workbook using openpyxl's read-only row iterator,
+    building each sheet's DataFrame out of row batches instead of letting
+    pandas buffer the whole sheet in memory before constructing it. Only used
+    for uploads over CHUNK_SIZE_BYTES; smaller files go through the normal
+    pandas path since the overhead isn't worth it there."""
+    wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
+    try:
+        tables = {}
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            row_iter = ws.iter_rows(values_only=True)
+            try:
+                header = next(row_iter)
+            except StopIteration:
+                tables[sheet_name] = pd.DataFrame()
+                continue
+            columns = [c if c is not None else f"Unnamed: {i}" for i, c in enumerate(header)]
+
+            chunks = []
+            batch = []
+            for row in row_iter:
+                batch.append(row)
+                if len(batch) >= CHUNK_ROWS:
+                    chunks.append(pd.DataFrame(batch, columns=columns))
+                    batch = []
+            if batch:
+                chunks.append(pd.DataFrame(batch, columns=columns))
+
+            tables[sheet_name] = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=columns)
+        return tables
+    finally:
+        wb.close()
+
+
+def _read_csv_chunked(content: bytes) -> pd.DataFrame:
+    """Same idea as _read_xlsx_chunked but for CSV, via pandas' native
+    chunksize reader instead of loading the whole file in one read_csv call."""
+    reader = pd.read_csv(io.BytesIO(content), chunksize=CHUNK_ROWS)
+    return pd.concat(reader, ignore_index=True)
+
 
 def _header_looks_like_data(df: pd.DataFrame) -> bool:
     """Detect the common 'headerless file' trap: pandas treated the first
@@ -48,12 +97,17 @@ def read_tables(content: bytes, filename: str) -> dict:
     Auto-recovers files that have no header row (single column of raw
     emails/hashes) which pandas would otherwise misread as a header."""
     name = filename.lower()
-    if name.endswith((".xlsx", ".xlsm", ".xls")):
+    if name.endswith((".xlsx", ".xlsm")) and len(content) > CHUNK_SIZE_BYTES:
+        tables = _read_xlsx_chunked(content)
+    elif name.endswith((".xlsx", ".xlsm", ".xls")):
         engine_kwargs = {"read_only": True} if name.endswith((".xlsx", ".xlsm")) else None
         xls = pd.ExcelFile(io.BytesIO(content), engine_kwargs=engine_kwargs)
         tables = {sheet: xls.parse(sheet) for sheet in xls.sheet_names}
     elif name.endswith(".csv"):
-        tables = {"Sheet1": pd.read_csv(io.BytesIO(content))}
+        if len(content) > CHUNK_SIZE_BYTES:
+            tables = {"Sheet1": _read_csv_chunked(content)}
+        else:
+            tables = {"Sheet1": pd.read_csv(io.BytesIO(content))}
     elif name.endswith(".txt"):
         lines = [l.strip() for l in content.decode("utf-8", errors="ignore").splitlines() if l.strip()]
         tables = {"Sheet1": pd.DataFrame({"value": lines})}
