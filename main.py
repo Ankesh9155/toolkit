@@ -115,24 +115,44 @@ async def email_scrubber_endpoint(
     except ValueError as e:
         raise HTTPException(400, str(e))
 
-    clean_bytes = logic.df_to_excel_bytes({"Clean Leads": result["clean_df"]})
-    supp_bytes = logic.df_to_excel_bytes({"Suppressed": result["suppressed_df"]})
-    dup_bytes = logic.df_to_excel_bytes({"Duplicates": result["duplicates_df"]})
-    all_bytes = logic.df_to_excel_bytes({"All Leads": result["annotated_df"]})
-    clean_token = _store(f"{out_filename}_clean.xlsx", clean_bytes,
-                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    supp_token = _store(f"{out_filename}_suppressed.xlsx", supp_bytes,
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    dup_token = _store(f"{out_filename}_duplicates.xlsx", dup_bytes,
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    annotated_df = result["annotated_df"]
+    mask = result["suppression_mask"]
+    preview_limit = 500
+
+    # Build + store each output one at a time, dropping each DataFrame as soon
+    # as it's serialized, instead of materializing clean/suppressed/duplicates
+    # all at once alongside annotated_df. That "all copies alive together"
+    # pattern was the biggest avoidable memory multiplier here — up to 4 full
+    # copies of the list at peak — and a likely contributor to OOMs on
+    # Render's 512MB instance even on lists well under 100MB.
+    all_bytes = logic.df_to_excel_bytes({"All Leads": annotated_df})
     all_token = _store(f"{out_filename}_all_leads.xlsx", all_bytes,
                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    del all_bytes
 
-    total = result["total_leads"]
-    preview_limit = 500
-    suppressed_only_df = result["annotated_df"][result["annotated_df"]["Found in suppression"] == "Yes"]
+    suppressed_df = annotated_df[mask]
+    suppressed_preview = logic.df_to_records(suppressed_df.head(preview_limit), limit=preview_limit)
+    supp_bytes = logic.df_to_excel_bytes({"Suppressed": suppressed_df})
+    del suppressed_df
+    supp_token = _store(f"{out_filename}_suppressed.xlsx", supp_bytes,
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    del supp_bytes
+
+    clean_df = annotated_df[~mask]
+    clean_bytes = logic.df_to_excel_bytes({"Clean Leads": clean_df})
+    del clean_df
+    clean_token = _store(f"{out_filename}_clean.xlsx", clean_bytes,
+                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    del clean_bytes
+
+    duplicates_df = result["duplicates_df"]
+    dup_bytes = logic.df_to_excel_bytes({"Duplicates": duplicates_df})
+    dup_token = _store(f"{out_filename}_duplicates.xlsx", dup_bytes,
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    del dup_bytes
+
     return JSONResponse({
-        "total_leads": total,
+        "total_leads": result["total_leads"],
         "suppressed": result["suppressed"],
         "clean": result["clean"],
         "duplicates": result["duplicates"],
@@ -141,8 +161,8 @@ async def email_scrubber_endpoint(
         "suppressed_download": f"/api/download/{supp_token}",
         "duplicates_download": f"/api/download/{dup_token}",
         "all_leads_download": f"/api/download/{all_token}",
-        "duplicates_preview": logic.df_to_records(result["duplicates_df"], limit=200),
-        "suppressed_preview": logic.df_to_records(suppressed_only_df, limit=preview_limit),
+        "duplicates_preview": logic.df_to_records(duplicates_df, limit=200),
+        "suppressed_preview": suppressed_preview,
         "suppressed_preview_truncated": result["suppressed"] > preview_limit,
     })
 

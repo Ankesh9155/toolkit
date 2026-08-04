@@ -295,8 +295,6 @@ def email_scrubber(supp_content, supp_name, lead_content, lead_name, email_colum
         return norm in supp_emails or md5_of(norm) in supp_hashes
 
     mask = leads_df[col].astype(str).apply(is_suppressed)
-    clean_df = leads_df[~mask]
-    suppressed_df = leads_df[mask]
 
     dup_reasons = find_duplicate_reasons(leads_df, col)
     duplicates_df = find_duplicates_in_column(leads_df, col)
@@ -310,16 +308,21 @@ def email_scrubber(supp_content, supp_name, lead_content, lead_name, email_colum
     leads_df["Duplicate reason"] = leads_df.index.map(lambda i: dup_reasons.get(i, ""))
     annotated_df = leads_df
 
+    # clean_df/suppressed_df are deliberately NOT built here: they're just
+    # `annotated_df` filtered by `mask`, and materializing both up front means
+    # 3 full-size copies of the list alive at once (annotated + clean +
+    # suppressed) before a single output file has even been written. The
+    # caller derives each one on demand, right before serializing it, and
+    # drops it immediately after — see main.py's email_scrubber_endpoint.
     return {
         "total_leads": len(leads_df),
         "suppressed": int(mask.sum()),
-        "clean": len(clean_df),
+        "clean": int((~mask).sum()),
         "duplicates": len(duplicates_df),
         "email_column_used": col,
-        "clean_df": clean_df,
-        "suppressed_df": suppressed_df,
         "annotated_df": annotated_df,
         "duplicates_df": duplicates_df,
+        "suppression_mask": mask,
     }
 
 
