@@ -15,59 +15,90 @@ Then open http://127.0.0.1:8000 in your browser.
   4. List Combine & Split     - merge multiple files with dedupe, or split one file by column
   5. List Comparison          - compare 2-3 lists (venn-style overlap)
 
-All processing happens in-memory; nothing is written to disk except transient
-result blobs kept in a process-local cache for download.
+Uploads are parsed and transformed in-memory. Generated result files are
+written to a temp directory on disk (not held as bytes in-process) and are
+served for download until they expire from a short-lived TTL cache.
 """
 
-import io
+import os
+import tempfile
 import time
 import uuid
 from typing import List, Optional
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import logic
 
 app = FastAPI(title="Suppression & TAL Toolkit")
 
-# In-memory store for generated result files, keyed by a random token.
-# {token: {"filename": str, "bytes": bytes, "media_type": str, "created": float}}
-# Entries are purged after _RESULT_TTL_SECONDS to avoid unbounded memory growth.
+# Reject uploads above this size outright, before they're fully read into
+# memory, instead of letting a huge file ride all the way through parsing
+# and Excel-writing and OOM-kill the process partway. Override with the
+# MAX_UPLOAD_MB env var to match whatever RAM the deployment actually has —
+# raising this number alone does NOT make bigger files safe; it only
+# changes where the line is drawn. See README for the real memory math.
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "200")) * 1024 * 1024
+
+# Generated result files are written to disk (an ephemeral temp dir), not
+# kept as bytes in a process-wide dict. Holding N large xlsx blobs in RAM
+# for the full TTL — on top of whatever a concurrent request is parsing —
+# was the other big memory multiplier; only file paths + metadata live in
+# memory now. {token: {"filename": str, "path": str, "media_type": str, "created": float}}
 _RESULTS = {}
 _RESULT_TTL_SECONDS = 20 * 60
+_RESULTS_DIR = tempfile.mkdtemp(prefix="toolkit_results_")
 
 
 def _purge_expired_results():
     now = time.time()
     expired = [t for t, item in _RESULTS.items() if now - item["created"] > _RESULT_TTL_SECONDS]
     for t in expired:
-        del _RESULTS[t]
+        item = _RESULTS.pop(t)
+        try:
+            os.remove(item["path"])
+        except OSError:
+            pass
 
 
 def _store(filename: str, data: bytes, media_type: str) -> str:
     _purge_expired_results()
     token = uuid.uuid4().hex
-    _RESULTS[token] = {"filename": filename, "bytes": data, "media_type": media_type, "created": time.time()}
+    path = os.path.join(_RESULTS_DIR, token)
+    with open(path, "wb") as f:
+        f.write(data)
+    _RESULTS[token] = {"filename": filename, "path": path, "media_type": media_type, "created": time.time()}
     return token
 
 
 @app.get("/api/download/{token}")
 def download(token: str):
     item = _RESULTS.get(token)
-    if not item:
+    if not item or not os.path.exists(item["path"]):
         raise HTTPException(404, "Result not found or expired. Re-run the tool.")
-    return StreamingResponse(
-        io.BytesIO(item["bytes"]),
-        media_type=item["media_type"],
-        headers={"Content-Disposition": f'attachment; filename="{item["filename"]}"'},
-    )
+    return FileResponse(item["path"], media_type=item["media_type"], filename=item["filename"])
 
 
 async def _read(upload: UploadFile):
-    content = await upload.read()
-    return content, upload.filename
+    # Read in bounded chunks and bail out the moment the cap is crossed,
+    # instead of buffering an unlimited amount before ever checking size.
+    chunks = []
+    total = 0
+    while True:
+        chunk = await upload.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(
+                413,
+                f"{upload.filename} exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB "
+                f"upload limit for this deployment.",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks), upload.filename
 
 
 async def _resolve_input(upload: Optional[UploadFile], pasted_text: Optional[str], label: str):

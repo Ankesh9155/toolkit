@@ -49,9 +49,31 @@ Open **http://127.0.0.1:8000** in your browser.
 - Column auto-detection looks for column names containing "email",
   "domain", "website", etc., and falls back to sampling values against
   email/domain regex patterns.
-- Generated files are held in memory only for download and are cleared when
-  the server restarts.
+- Generated files are written to a temp directory on disk (not kept as bytes
+  in memory) and are cleared after 20 minutes or when the server restarts.
 - Uploads over 9MB (.xlsx/.xlsm/.csv) are parsed in row batches (20,000 rows
-  at a time) instead of being loaded whole, so peak memory during parsing
+  at a time) instead of being loaded whole, so peak memory during *parsing*
   stays bounded on larger files. Output is identical either way — this only
   changes how the file is read in, not what comes out.
+- Uploads are capped at 200MB by default (`MAX_UPLOAD_MB` env var to
+  change), rejected with a clean 413 instead of exhausting memory mid-parse.
+  This cap does not by itself make large files "safe" — see "Memory sizing"
+  below.
+
+## Memory sizing for large files
+
+Row-batch parsing only bounds the *parsing* step; once a file is parsed it
+still becomes one full pandas DataFrame in memory, typically **3–8x the
+raw file size** (worse for .xlsx than .csv, due to per-cell Python object
+overhead). On top of that, each tool builds one or more full-size Excel
+outputs before they're written to disk. So for a single request, peak
+memory is roughly:
+
+    raw upload bytes + (3-8x that) as a DataFrame + one Excel output buffer
+
+A 40MB upload can peak north of 300-400MB; a 200MB upload can peak well
+over 1GB. Render's Starter instance (512MB RAM) cannot reliably process
+uploads much above ~40-60MB no matter how the code chunks the read —
+**the fix for the top of a 1-200MB range is more RAM, not more chunking.**
+If you need to reliably support uploads up to 200MB, move the Render
+service to a plan with at least 2GB RAM (Standard tier or higher).
