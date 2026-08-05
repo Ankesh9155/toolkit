@@ -51,29 +51,45 @@ Open **http://127.0.0.1:8000** in your browser.
   email/domain regex patterns.
 - Generated files are written to a temp directory on disk (not kept as bytes
   in memory) and are cleared after 20 minutes or when the server restarts.
-- Uploads over 9MB (.xlsx/.xlsm/.csv) are parsed in row batches (20,000 rows
-  at a time) instead of being loaded whole, so peak memory during *parsing*
-  stays bounded on larger files. Output is identical either way — this only
-  changes how the file is read in, not what comes out.
-- Uploads are capped at 200MB by default (`MAX_UPLOAD_MB` env var to
-  change), rejected with a clean 413 instead of exhausting memory mid-parse.
-  This cap does not by itself make large files "safe" — see "Memory sizing"
-  below.
+- Uploads over 9MB (.xlsx) use openpyxl's read-only row iterator instead of
+  the default engine, which parses the whole workbook's XML into memory up
+  front. Output is identical either way — this only changes how the file is
+  read in, not what comes out.
+- Uploads are capped at 40MB by default (`MAX_UPLOAD_MB` env var to change),
+  rejected with a clean 413 instead of exhausting memory mid-parse — sized
+  for Render Free's 512MB RAM. See "Memory sizing" below.
+- At most one upload is parsed/transformed at a time (`MAX_CONCURRENT_JOBS`
+  env var, default 1). Extra requests queue instead of running in parallel,
+  since concurrent large uploads is the fastest way to multiply peak memory
+  past what one request alone would use.
 
 ## Memory sizing for large files
 
-Row-batch parsing only bounds the *parsing* step; once a file is parsed it
-still becomes one full pandas DataFrame in memory, typically **3–8x the
-raw file size** (worse for .xlsx than .csv, due to per-cell Python object
-overhead). On top of that, each tool builds one or more full-size Excel
-outputs before they're written to disk. So for a single request, peak
-memory is roughly:
+Every tool loads its input into a pandas DataFrame, which typically runs
+**3–8x the raw file size** in memory (worse for .xlsx than .csv, due to
+per-cell Python object overhead), then builds one or more full-size Excel
+outputs from it. So for a single request, peak memory is roughly:
 
     raw upload bytes + (3-8x that) as a DataFrame + one Excel output buffer
 
-A 40MB upload can peak north of 300-400MB; a 200MB upload can peak well
-over 1GB. Render's Starter instance (512MB RAM) cannot reliably process
-uploads much above ~40-60MB no matter how the code chunks the read —
-**the fix for the top of a 1-200MB range is more RAM, not more chunking.**
-If you need to reliably support uploads up to 200MB, move the Render
-service to a plan with at least 2GB RAM (Standard tier or higher).
+A handful of optimizations keep that peak as low as it can go without
+changing what any tool outputs:
+- Chunked reads build the file's rows once instead of building N partial
+  DataFrames and concatenating them (concat briefly holds both copies at
+  once — see comments in `logic.py`'s `_read_xlsx_chunked`/`_read_csv_chunked`).
+- MD5 hashes in the suppression set are stored as raw bytes instead of hex
+  strings (~35-40% less memory for that structure).
+- Requests are serialized (`MAX_CONCURRENT_JOBS=1`) so peak memory reflects
+  one upload at a time, not however many arrive together.
+- `gc.collect()` runs at specific points where openpyxl/xlsxwriter objects
+  with reference cycles (worksheet ↔ parent workbook, etc.) go out of scope
+  — those need the cyclic collector, not just refcounting, to actually free.
+
+None of this changes the underlying math: a 40MB upload can still peak
+north of 150–300MB depending on file shape, which is why the default cap
+is 40MB on a 512MB instance, not higher. Going meaningfully past that
+without more RAM would require processing rows in a streaming pass instead
+of building a DataFrame at all — a real rewrite of the processing pipeline,
+not a tuning change. If you need to reliably support uploads much larger
+than 40MB, either that rewrite or moving the Render service to a plan with
+more RAM are the two real options.

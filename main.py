@@ -20,6 +20,8 @@ written to a temp directory on disk (not held as bytes in-process) and are
 served for download until they expire from a short-lived TTL cache.
 """
 
+import asyncio
+import gc
 import os
 import tempfile
 import time
@@ -36,11 +38,22 @@ app = FastAPI(title="Suppression & TAL Toolkit")
 
 # Reject uploads above this size outright, before they're fully read into
 # memory, instead of letting a huge file ride all the way through parsing
-# and Excel-writing and OOM-kill the process partway. Override with the
-# MAX_UPLOAD_MB env var to match whatever RAM the deployment actually has —
-# raising this number alone does NOT make bigger files safe; it only
-# changes where the line is drawn. See README for the real memory math.
-MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "200")) * 1024 * 1024
+# and Excel-writing and OOM-kill the process partway. Default matches the
+# actual ceiling this deployment (Render Free, 512MB RAM) can process
+# without more RAM: a 40MB upload is roughly the largest this pipeline can
+# turn into a pandas DataFrame + Excel output(s) and stay under 512MB.
+# Override with the MAX_UPLOAD_MB env var — but raising it does NOT make
+# bigger files safe on this instance; it only changes where the line is
+# drawn. See README for the underlying memory math.
+MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_MB", "40")) * 1024 * 1024
+
+# At most this many uploads are parsed/transformed at once. Each concurrent
+# request multiplies peak memory (raw bytes + DataFrame(s) + Excel output),
+# so on a memory-constrained deployment two overlapping 40MB requests can
+# OOM where one at a time would not. Extra requests wait for a slot instead
+# of running in parallel — same inputs, same outputs, just serialized.
+# Override with MAX_CONCURRENT_JOBS if the deployment ever gets more RAM.
+_PROCESSING_SEMAPHORE = asyncio.Semaphore(int(os.environ.get("MAX_CONCURRENT_JOBS", "1")))
 
 # Generated result files are written to disk (an ephemeral temp dir), not
 # kept as bytes in a process-wide dict. Holding N large xlsx blobs in RAM
@@ -84,21 +97,25 @@ def download(token: str):
 async def _read(upload: UploadFile):
     # Read in bounded chunks and bail out the moment the cap is crossed,
     # instead of buffering an unlimited amount before ever checking size.
-    chunks = []
-    total = 0
+    # Accumulating into a bytearray (grown in place) instead of a list of
+    # chunks joined at the end avoids briefly holding the data twice —
+    # list-of-chunks + b"".join(chunks) has both the chunk list and the
+    # freshly-joined bytes alive at once for the moment join() runs.
+    buf = bytearray()
     while True:
         chunk = await upload.read(1024 * 1024)
         if not chunk:
             break
-        total += len(chunk)
-        if total > MAX_UPLOAD_BYTES:
+        buf.extend(chunk)
+        if len(buf) > MAX_UPLOAD_BYTES:
             raise HTTPException(
                 413,
                 f"{upload.filename} exceeds the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB "
                 f"upload limit for this deployment.",
             )
-        chunks.append(chunk)
-    return b"".join(chunks), upload.filename
+    content = bytes(buf)
+    del buf
+    return content, upload.filename
 
 
 async def _resolve_input(upload: Optional[UploadFile], pasted_text: Optional[str], label: str):
@@ -121,13 +138,15 @@ async def lead_columns_endpoint(
     file: Optional[UploadFile] = File(None),
     text: Optional[str] = Form(None),
 ):
-    content, name = await _resolve_input(file, text, "leads_file")
-    try:
-        df = logic.read_single_table(content, name)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    detected = logic.detect_email_column(df)
-    return JSONResponse({"columns": list(df.columns), "detected": detected})
+    async with _PROCESSING_SEMAPHORE:
+        content, name = await _resolve_input(file, text, "leads_file")
+        try:
+            df = logic.read_single_table(content, name)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        del content
+        detected = logic.detect_email_column(df)
+        return JSONResponse({"columns": list(df.columns), "detected": detected})
 
 
 @app.post("/api/email-scrubber")
@@ -139,63 +158,79 @@ async def email_scrubber_endpoint(
     email_column: Optional[str] = Form(None),
     out_filename: str = Form("scrubbed_leads"),
 ):
-    supp_content, supp_name = await _resolve_input(suppression_file, suppression_text, "suppression_file")
-    lead_content, lead_name = await _resolve_input(leads_file, leads_text, "leads_file")
-    try:
-        result = logic.email_scrubber(supp_content, supp_name, lead_content, lead_name, email_column)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    async with _PROCESSING_SEMAPHORE:
+        supp_content, supp_name = await _resolve_input(suppression_file, suppression_text, "suppression_file")
+        lead_content, lead_name = await _resolve_input(leads_file, leads_text, "leads_file")
+        try:
+            result = logic.email_scrubber(supp_content, supp_name, lead_content, lead_name, email_column)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        # Both are fully parsed into result's DataFrames by this point and
+        # aren't touched again, but as local variables they'd otherwise stay
+        # alive for the rest of this (fairly long) function.
+        del supp_content, lead_content
 
-    annotated_df = result["annotated_df"]
-    mask = result["suppression_mask"]
-    preview_limit = 500
+        annotated_df = result["annotated_df"]
+        mask = result["suppression_mask"]
+        preview_limit = 500
 
-    # Build + store each output one at a time, dropping each DataFrame as soon
-    # as it's serialized, instead of materializing clean/suppressed/duplicates
-    # all at once alongside annotated_df. That "all copies alive together"
-    # pattern was the biggest avoidable memory multiplier here — up to 4 full
-    # copies of the list at peak — and a likely contributor to OOMs on
-    # Render's 512MB instance even on lists well under 100MB.
-    all_bytes = logic.df_to_excel_bytes({"All Leads": annotated_df})
-    all_token = _store(f"{out_filename}_all_leads.xlsx", all_bytes,
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    del all_bytes
+        # Build + store each output one at a time, dropping each DataFrame as soon
+        # as it's serialized, instead of materializing clean/suppressed/duplicates
+        # all at once alongside annotated_df. That "all copies alive together"
+        # pattern was the biggest avoidable memory multiplier here — up to 4 full
+        # copies of the list at peak — and a likely contributor to OOMs on
+        # Render's 512MB instance even on lists well under 100MB.
+        all_bytes = logic.df_to_excel_bytes({"All Leads": annotated_df})
+        all_token = _store(f"{out_filename}_all_leads.xlsx", all_bytes,
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        del all_bytes
 
-    suppressed_df = annotated_df[mask]
-    suppressed_preview = logic.df_to_records(suppressed_df.head(preview_limit), limit=preview_limit)
-    supp_bytes = logic.df_to_excel_bytes({"Suppressed": suppressed_df})
-    del suppressed_df
-    supp_token = _store(f"{out_filename}_suppressed.xlsx", supp_bytes,
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    del supp_bytes
+        suppressed_df = annotated_df[mask]
+        suppressed_preview = logic.df_to_records(suppressed_df.head(preview_limit), limit=preview_limit)
+        supp_bytes = logic.df_to_excel_bytes({"Suppressed": suppressed_df})
+        del suppressed_df
+        supp_token = _store(f"{out_filename}_suppressed.xlsx", supp_bytes,
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        del supp_bytes
 
-    clean_df = annotated_df[~mask]
-    clean_bytes = logic.df_to_excel_bytes({"Clean Leads": clean_df})
-    del clean_df
-    clean_token = _store(f"{out_filename}_clean.xlsx", clean_bytes,
-                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    del clean_bytes
+        clean_df = annotated_df[~mask]
+        clean_bytes = logic.df_to_excel_bytes({"Clean Leads": clean_df})
+        del clean_df
+        clean_token = _store(f"{out_filename}_clean.xlsx", clean_bytes,
+                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        del clean_bytes
 
-    duplicates_df = result["duplicates_df"]
-    dup_bytes = logic.df_to_excel_bytes({"Duplicates": duplicates_df})
-    dup_token = _store(f"{out_filename}_duplicates.xlsx", dup_bytes,
-                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    del dup_bytes
+        duplicates_df = result["duplicates_df"]
+        dup_bytes = logic.df_to_excel_bytes({"Duplicates": duplicates_df})
+        dup_token = _store(f"{out_filename}_duplicates.xlsx", dup_bytes,
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        del dup_bytes
 
-    return JSONResponse({
-        "total_leads": result["total_leads"],
-        "suppressed": result["suppressed"],
-        "clean": result["clean"],
-        "duplicates": result["duplicates"],
-        "email_column_used": result["email_column_used"],
-        "clean_download": f"/api/download/{clean_token}",
-        "suppressed_download": f"/api/download/{supp_token}",
-        "duplicates_download": f"/api/download/{dup_token}",
-        "all_leads_download": f"/api/download/{all_token}",
-        "duplicates_preview": logic.df_to_records(duplicates_df, limit=200),
-        "suppressed_preview": suppressed_preview,
-        "suppressed_preview_truncated": result["suppressed"] > preview_limit,
-    })
+        response = JSONResponse({
+            "total_leads": result["total_leads"],
+            "suppressed": result["suppressed"],
+            "clean": result["clean"],
+            "duplicates": result["duplicates"],
+            "email_column_used": result["email_column_used"],
+            "clean_download": f"/api/download/{clean_token}",
+            "suppressed_download": f"/api/download/{supp_token}",
+            "duplicates_download": f"/api/download/{dup_token}",
+            "all_leads_download": f"/api/download/{all_token}",
+            "duplicates_preview": logic.df_to_records(duplicates_df, limit=200),
+            "suppressed_preview": suppressed_preview,
+            "suppressed_preview_truncated": result["suppressed"] > preview_limit,
+        })
+        # This endpoint is the heaviest in the app (4 full Excel builds off
+        # one lead list). df_to_excel_bytes() already collects after each
+        # xlsxwriter workbook it builds, but annotated_df/result themselves
+        # are about to go out of scope here too — one last sweep before the
+        # semaphore releases the next queued request means this request's
+        # garbage doesn't linger into the next one's peak. Note this frees
+        # Python-heap garbage; it does not force the OS to reclaim RSS, but
+        # it does keep that memory available for reuse within this process.
+        del result, annotated_df, mask, duplicates_df
+        gc.collect()
+        return response
 
 
 # ---------------------------------------------------------------------------
@@ -208,28 +243,30 @@ async def tal_scrubber_endpoint(
     tal_file: UploadFile = File(...),
     out_filename: str = Form("scrubbed_tal"),
 ):
-    supp_content, supp_name = await _read(suppression_file)
-    tal_content, tal_name = await _read(tal_file)
-    try:
-        result = logic.tal_supp_scrubber(supp_content, supp_name, tal_content, tal_name)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    async with _PROCESSING_SEMAPHORE:
+        supp_content, supp_name = await _read(suppression_file)
+        tal_content, tal_name = await _read(tal_file)
+        try:
+            result = logic.tal_supp_scrubber(supp_content, supp_name, tal_content, tal_name)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        del supp_content, tal_content
 
-    clean_bytes = logic.df_to_excel_bytes({"Clean TAL": result["clean_df"]})
-    supp_bytes = logic.df_to_excel_bytes({"Suppressed": result["suppressed_df"]})
-    clean_token = _store(f"{out_filename}_clean.xlsx", clean_bytes,
-                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    supp_token = _store(f"{out_filename}_suppressed.xlsx", supp_bytes,
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        clean_bytes = logic.df_to_excel_bytes({"Clean TAL": result["clean_df"]})
+        supp_bytes = logic.df_to_excel_bytes({"Suppressed": result["suppressed_df"]})
+        clean_token = _store(f"{out_filename}_clean.xlsx", clean_bytes,
+                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        supp_token = _store(f"{out_filename}_suppressed.xlsx", supp_bytes,
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    return JSONResponse({
-        "total_tal": result["total_tal"],
-        "suppressed": result["suppressed"],
-        "clean": result["clean"],
-        "domain_column_used": result["domain_column_used"],
-        "clean_download": f"/api/download/{clean_token}",
-        "suppressed_download": f"/api/download/{supp_token}",
-    })
+        return JSONResponse({
+            "total_tal": result["total_tal"],
+            "suppressed": result["suppressed"],
+            "clean": result["clean"],
+            "domain_column_used": result["domain_column_used"],
+            "clean_download": f"/api/download/{clean_token}",
+            "suppressed_download": f"/api/download/{supp_token}",
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -243,27 +280,29 @@ async def tal_overlap_endpoint(
     email_suppression_file: UploadFile = File(...),
     out_filename: str = Form("enriched_tal"),
 ):
-    tal_content, tal_name = await _read(tal_file)
-    acct_content, acct_name = await _read(account_suppression_file)
-    email_content, email_name = await _read(email_suppression_file)
-    try:
-        result = logic.tal_overlap_analysis(
-            tal_content, tal_name, acct_content, acct_name, email_content, email_name
-        )
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    async with _PROCESSING_SEMAPHORE:
+        tal_content, tal_name = await _read(tal_file)
+        acct_content, acct_name = await _read(account_suppression_file)
+        email_content, email_name = await _read(email_suppression_file)
+        try:
+            result = logic.tal_overlap_analysis(
+                tal_content, tal_name, acct_content, acct_name, email_content, email_name
+            )
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        del tal_content, acct_content, email_content
 
-    bytes_out = logic.df_to_excel_bytes({"Enriched TAL": result["enriched_df"]})
-    token = _store(f"{out_filename}.xlsx", bytes_out,
-                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        bytes_out = logic.df_to_excel_bytes({"Enriched TAL": result["enriched_df"]})
+        token = _store(f"{out_filename}.xlsx", bytes_out,
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    return JSONResponse({
-        "total_tal": result["total_tal"],
-        "on_account_supp": result["on_account_supp"],
-        "on_email_supp": result["on_email_supp"],
-        "domain_column_used": result["domain_column_used"],
-        "download": f"/api/download/{token}",
-    })
+        return JSONResponse({
+            "total_tal": result["total_tal"],
+            "on_account_supp": result["on_account_supp"],
+            "on_email_supp": result["on_email_supp"],
+            "domain_column_used": result["domain_column_used"],
+            "download": f"/api/download/{token}",
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -275,29 +314,31 @@ async def combine_endpoint(
     files: List[UploadFile] = File(...),
     out_filename: str = Form("combined"),
 ):
-    pairs = []
-    for f in files:
-        content, name = await _read(f)
-        pairs.append((content, name))
-    try:
-        result = logic.combine_lists(pairs)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    async with _PROCESSING_SEMAPHORE:
+        pairs = []
+        for f in files:
+            content, name = await _read(f)
+            pairs.append((content, name))
+        try:
+            result = logic.combine_lists(pairs)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        del pairs
 
-    acct_bytes = logic.df_to_excel_bytes({"Accounts": result["account_df"]})
-    email_bytes = logic.df_to_excel_bytes({"Emails": result["email_df"]})
-    acct_token = _store(f"{out_filename}_accounts.xlsx", acct_bytes,
-                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    email_token = _store(f"{out_filename}_emails.xlsx", email_bytes,
-                         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        acct_bytes = logic.df_to_excel_bytes({"Accounts": result["account_df"]})
+        email_bytes = logic.df_to_excel_bytes({"Emails": result["email_df"]})
+        acct_token = _store(f"{out_filename}_accounts.xlsx", acct_bytes,
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        email_token = _store(f"{out_filename}_emails.xlsx", email_bytes,
+                             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    return JSONResponse({
-        "sources": result["sources"],
-        "account_rows": result["account_rows"],
-        "email_rows": result["email_rows"],
-        "accounts_download": f"/api/download/{acct_token}",
-        "emails_download": f"/api/download/{email_token}",
-    })
+        return JSONResponse({
+            "sources": result["sources"],
+            "account_rows": result["account_rows"],
+            "email_rows": result["email_rows"],
+            "accounts_download": f"/api/download/{acct_token}",
+            "emails_download": f"/api/download/{email_token}",
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -306,12 +347,14 @@ async def combine_endpoint(
 
 @app.post("/api/split/columns")
 async def split_columns_endpoint(file: UploadFile = File(...)):
-    content, name = await _read(file)
-    try:
-        df = logic.read_single_table(content, name)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    return JSONResponse({"columns": list(df.columns)})
+    async with _PROCESSING_SEMAPHORE:
+        content, name = await _read(file)
+        try:
+            df = logic.read_single_table(content, name)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        del content
+        return JSONResponse({"columns": list(df.columns)})
 
 
 @app.post("/api/split")
@@ -320,17 +363,19 @@ async def split_endpoint(
     column: str = Form(...),
     out_filename: str = Form("split_output"),
 ):
-    content, name = await _read(file)
-    try:
-        result = logic.split_list(content, name, column)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
+    async with _PROCESSING_SEMAPHORE:
+        content, name = await _read(file)
+        try:
+            result = logic.split_list(content, name, column)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        del content
 
-    token = _store(f"{out_filename}.zip", result["zip_bytes"], "application/zip")
-    return JSONResponse({
-        "groups": result["groups"],
-        "download": f"/api/download/{token}",
-    })
+        token = _store(f"{out_filename}.zip", result["zip_bytes"], "application/zip")
+        return JSONResponse({
+            "groups": result["groups"],
+            "download": f"/api/download/{token}",
+        })
 
 
 # ---------------------------------------------------------------------------
@@ -348,33 +393,36 @@ async def list_compare_endpoint(
     dedupe_within: bool = Form(True),
     out_filename: str = Form("list_comparison"),
 ):
-    pairs = []
-    for idx, (f, t) in enumerate([(list1, list1_text), (list2, list2_text), (list3, list3_text)], start=1):
-        has_file = f is not None and getattr(f, "filename", None)
-        has_text = t and t.strip()
-        if not has_file and not has_text:
-            if idx <= 2:
-                raise HTTPException(400, f"List {idx} is required (upload a file or paste values).")
-            continue
-        content, name = await _resolve_input(f, t, f"list{idx}")
-        pairs.append((content, name))
+    async with _PROCESSING_SEMAPHORE:
+        pairs = []
+        for idx, (f, t) in enumerate([(list1, list1_text), (list2, list2_text), (list3, list3_text)], start=1):
+            has_file = f is not None and getattr(f, "filename", None)
+            has_text = t and t.strip()
+            if not has_file and not has_text:
+                if idx <= 2:
+                    raise HTTPException(400, f"List {idx} is required (upload a file or paste values).")
+                continue
+            content, name = await _resolve_input(f, t, f"list{idx}")
+            pairs.append((content, name))
 
-    try:
-        result = logic.compare_lists(pairs, dedupe_within=dedupe_within)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    bytes_out = logic.df_to_excel_bytes({"Comparison": result["result_df"]})
-    token = _store(f"{out_filename}.xlsx", bytes_out,
-                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        try:
+            result = logic.compare_lists(pairs, dedupe_within=dedupe_within)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        del pairs
 
-    return JSONResponse({
-        "total_unique": result["total_unique"],
-        "in_all": result["in_all"],
-        "in_exactly_2": result["in_exactly_2"],
-        "in_exactly_1": result["in_exactly_1"],
-        "per_list_counts": result["per_list_counts"],
-        "download": f"/api/download/{token}",
-    })
+        bytes_out = logic.df_to_excel_bytes({"Comparison": result["result_df"]})
+        token = _store(f"{out_filename}.xlsx", bytes_out,
+                       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+        return JSONResponse({
+            "total_unique": result["total_unique"],
+            "in_all": result["in_all"],
+            "in_exactly_2": result["in_exactly_2"],
+            "in_exactly_1": result["in_exactly_1"],
+            "per_list_counts": result["per_list_counts"],
+            "download": f"/api/download/{token}",
+        })
 
 
 # ---------------------------------------------------------------------------
