@@ -4,6 +4,7 @@ All functions take raw bytes + filename in, return pandas DataFrames / dicts out
 No file-system dependency beyond what the caller provides.
 """
 
+import gc
 import hashlib
 import io
 import re
@@ -17,9 +18,10 @@ MD5_RE = re.compile(r"^[a-fA-F0-9]{32}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 DOMAIN_RE = re.compile(r"^(?:[a-z0-9-]+\.)+[a-z]{2,}$", re.IGNORECASE)
 
-# Uploads larger than this are parsed in row batches instead of being handed
-# to pandas whole, so peak memory during parsing stays bounded regardless of
-# how big the source file is (matters on Render's 512MB instance).
+# Uploads over this size use the read-only .xlsx row iterator (below) instead
+# of the default openpyxl/pandas engine, which parses the whole workbook's
+# XML into memory before handing it to pandas. Below this size that overhead
+# isn't worth it, so the plain pandas path is used instead.
 CHUNK_SIZE_BYTES = 9 * 1024 * 1024  # 9 MB
 CHUNK_ROWS = 20_000
 
@@ -29,11 +31,22 @@ CHUNK_ROWS = 20_000
 # ---------------------------------------------------------------------------
 
 def _read_xlsx_chunked(content: bytes) -> dict:
-    """Stream an .xlsx/.xlsm workbook using openpyxl's read-only row iterator,
-    building each sheet's DataFrame out of row batches instead of letting
-    pandas buffer the whole sheet in memory before constructing it. Only used
-    for uploads over CHUNK_SIZE_BYTES; smaller files go through the normal
-    pandas path since the overhead isn't worth it there."""
+    """Stream an .xlsx/.xlsm workbook using openpyxl's read-only row iterator
+    instead of letting the default engine parse the whole sheet's XML into
+    memory up front. Only used for uploads over CHUNK_SIZE_BYTES; smaller
+    files go through the normal pandas path since the overhead isn't worth
+    it there.
+
+    Rows are accumulated into one flat list per sheet and turned into a
+    DataFrame exactly once. An earlier version built a separate DataFrame
+    per CHUNK_ROWS batch and pd.concat()'d them at the end — pd.concat()
+    converts its input into a list of the *whole* set of chunk DataFrames
+    before combining them, so that pattern briefly held the batch DataFrames
+    (already ~100% of the sheet's data) *and* the freshly-built combined
+    DataFrame at the same time, roughly doubling peak memory for no benefit.
+    Accumulating raw rows and building the DataFrame once avoids that
+    doubling; CHUNK_ROWS is kept only as a size hint, not a real batch
+    boundary, since there's nothing left to batch by."""
     wb = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
     try:
         tables = {}
@@ -47,27 +60,28 @@ def _read_xlsx_chunked(content: bytes) -> dict:
                 continue
             columns = [c if c is not None else f"Unnamed: {i}" for i, c in enumerate(header)]
 
-            chunks = []
-            batch = []
-            for row in row_iter:
-                batch.append(row)
-                if len(batch) >= CHUNK_ROWS:
-                    chunks.append(pd.DataFrame(batch, columns=columns))
-                    batch = []
-            if batch:
-                chunks.append(pd.DataFrame(batch, columns=columns))
-
-            tables[sheet_name] = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame(columns=columns)
+            rows = list(row_iter)
+            tables[sheet_name] = pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(columns=columns)
+            del rows
         return tables
     finally:
         wb.close()
 
 
 def _read_csv_chunked(content: bytes) -> pd.DataFrame:
-    """Same idea as _read_xlsx_chunked but for CSV, via pandas' native
-    chunksize reader instead of loading the whole file in one read_csv call."""
-    reader = pd.read_csv(io.BytesIO(content), chunksize=CHUNK_ROWS)
-    return pd.concat(reader, ignore_index=True)
+    """Historically this used pandas' chunksize reader plus pd.concat(), on
+    the same theory as the xlsx path above — but pd.concat() materializes
+    every chunk into a list before combining them, so it bought nothing and
+    cost an extra full copy at concat time (same doubling described in
+    _read_xlsx_chunked's docstring). It also risked a subtly different
+    result: pandas infers each column's dtype per chunk when chunksize is
+    used, so a column that looks all-integer in an early chunk but gains a
+    blank/text value in a later one can end up with a different dtype than
+    reading the file in one pass would produce. A single read_csv call lets
+    pandas' C parser infer dtypes from the whole column, which is both
+    lower-peak (no chunk list + concat copy) and guarantees the same output
+    regardless of file size."""
+    return pd.read_csv(io.BytesIO(content))
 
 
 def _header_looks_like_data(df: pd.DataFrame) -> bool:
@@ -99,6 +113,13 @@ def read_tables(content: bytes, filename: str) -> dict:
     name = filename.lower()
     if name.endswith((".xlsx", ".xlsm")) and len(content) > CHUNK_SIZE_BYTES:
         tables = _read_xlsx_chunked(content)
+        # openpyxl's Workbook/Worksheet objects reference each other (sheet
+        # -> parent workbook -> sheets list, etc.), so plain refcounting
+        # can't reclaim them even after wb.close() releases the file handle
+        # inside _read_xlsx_chunked — only the cyclic collector can. Force a
+        # collection here, before the DataFrame(s) just built stick around
+        # for the rest of the request, so the two don't peak together.
+        gc.collect()
     elif name.endswith((".xlsx", ".xlsm", ".xls")):
         engine_kwargs = {"read_only": True} if name.endswith((".xlsx", ".xlsm")) else None
         xls = pd.ExcelFile(io.BytesIO(content), engine_kwargs=engine_kwargs)
@@ -206,7 +227,14 @@ def detect_domain_column(df: pd.DataFrame):
 
 def build_suppression_sets(content: bytes, filename: str):
     """Suppression file can be CSV/TXT (one value per line) or XLSX (auto-detect column).
-    Values can be plain emails or MD5 hashes, mixed."""
+    Values can be plain emails or MD5 hashes, mixed.
+
+    Hashes are stored as raw 16-byte values (bytes.fromhex) instead of the
+    32-character hex string: a Python str object has per-object overhead on
+    top of its character data, so the hex string form runs roughly 80 bytes
+    per hash vs. ~50 bytes for the equivalent bytes object — about 35-40%
+    less for this set specifically. classify() already validated the value
+    against MD5_RE, so it's guaranteed to be valid hex here."""
     tables = read_tables(content, filename)
     supp_emails, supp_hashes = set(), set()
     for df in tables.values():
@@ -223,7 +251,7 @@ def build_suppression_sets(content: bytes, filename: str):
             if kind == "email":
                 supp_emails.add(norm)
             elif kind == "md5":
-                supp_hashes.add(norm)
+                supp_hashes.add(bytes.fromhex(norm))
     return supp_emails, supp_hashes
 
 
@@ -292,7 +320,7 @@ def email_scrubber(supp_content, supp_name, lead_content, lead_name, email_colum
         kind, norm = kind_norm
         if kind != "email":
             return False
-        return norm in supp_emails or md5_of(norm) in supp_hashes
+        return norm in supp_emails or bytes.fromhex(md5_of(norm)) in supp_hashes
 
     mask = leads_df[col].astype(str).apply(is_suppressed)
 
@@ -572,7 +600,18 @@ def df_to_excel_bytes(sheets: dict) -> bytes:
             safe_name = sheet_name[:31]
             (df if df is not None else pd.DataFrame()).to_excel(writer, sheet_name=safe_name, index=False)
     buf.seek(0)
-    return buf.getvalue()
+    data = buf.getvalue()
+    del buf
+    # Same reasoning as the xlsx-read side: xlsxwriter's Workbook holds
+    # cyclic references (worksheets/formats <-> parent workbook) that need
+    # the cyclic collector, not just refcounting, to actually free. The
+    # `with` block above has already exited (writer is closed), so this
+    # reclaims that object graph right away instead of leaving it for
+    # whenever the collector would have run on its own — which matters when
+    # this function is about to be called 3 more times in the same request
+    # (see email_scrubber_endpoint in main.py).
+    gc.collect()
+    return data
 
 
 def df_to_records(df: pd.DataFrame, limit: int = 200) -> list:
